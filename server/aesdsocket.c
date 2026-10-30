@@ -9,12 +9,34 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <syslog.h>
+#include <pthread.h>
+#include <time.h>
+#include <sys/queue.h>
+
 
 #define PORT 9000
 #define DATA_FILE "/var/tmp/aesdsocketdata"
 #define BUFFER_SIZE 1024
 
 static volatile sig_atomic_t stop_requested = 0;
+/* Protect access to the shared socket data file. */
+static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Information about each connected client thread. */
+struct client_thread {
+    pthread_t thread_id;
+    int client_fd;
+    int completed;
+    char client_ip[INET_ADDRSTRLEN];
+    SLIST_ENTRY(client_thread) entries;
+};
+
+/* Singly linked list of client threads. */
+SLIST_HEAD(client_thread_list, client_thread);
+
+static struct client_thread_list client_threads =
+    SLIST_HEAD_INITIALIZER(client_threads);
+
 
 static void signal_handler(int signo)
 {
@@ -146,24 +168,166 @@ static void handle_client(int client_fd)
 
             packet[packet_length++] = buffer[i];
 
-            if (buffer[i] == '\n') {
-                if (append_packet(packet, packet_length) != 0) {
-                    free(packet);
-                    return;
-                }
+	if (buffer[i] == '\n') {
+ 	   pthread_mutex_lock(&file_mutex);
 
-                if (send_file(client_fd) != 0) {
-                    free(packet);
-                    return;
-                }
+    	   int result = append_packet(packet, packet_length);
 
-                packet_length = 0;
-            }
+           if (result == 0) {
+               result = send_file(client_fd);
+           }
+
+           pthread_mutex_unlock(&file_mutex);
+
+           if (result != 0) {
+               free(packet);
+               return;
+           }
+
+           packet_length = 0;
+          }
+
+
         }
     }
 
     free(packet);
 }
+
+/* Thread function for handling one client connection. */
+static void *client_thread_func(void *arg)
+{
+    struct client_thread *client = (struct client_thread *)arg;
+
+    syslog(LOG_INFO, "Client thread started for %s",
+           client->client_ip);
+
+    /* Process data received from this client. */
+    handle_client(client->client_fd);
+
+    /* Close the socket safely and mark it as unavailable. */
+    pthread_mutex_lock(&file_mutex);
+    close(client->client_fd);
+    client->client_fd = -1;
+    pthread_mutex_unlock(&file_mutex);
+    
+    syslog(LOG_INFO, "Client thread finished for %s",
+    client->client_ip);
+
+    /* Mark this thread as completed safely. */
+    pthread_mutex_lock(&file_mutex);
+    client->completed = 1;
+    pthread_mutex_unlock(&file_mutex);
+    
+    
+    return NULL;
+}
+
+/* Join completed client threads and release their memory. */
+static void cleanup_completed_threads(void)
+{
+    struct client_thread *client = SLIST_FIRST(&client_threads);
+
+    while (client != NULL) {
+        struct client_thread *next = SLIST_NEXT(client, entries);
+
+        pthread_mutex_lock(&file_mutex);
+        int completed = client->completed;
+        pthread_mutex_unlock(&file_mutex);
+
+        if (completed) {
+            pthread_join(client->thread_id, NULL);
+
+            SLIST_REMOVE(&client_threads, client,
+                         client_thread, entries);
+
+            free(client);
+        }
+
+        client = next;
+    }
+}
+
+
+/* Stop all client connections and join their threads. */
+static void shutdown_client_threads(void)
+{
+    struct client_thread *client;
+
+    /* Unblock any client threads waiting in recv(). */
+    SLIST_FOREACH(client, &client_threads, entries) {
+    pthread_mutex_lock(&file_mutex);
+
+    if (client->client_fd >= 0) {
+    shutdown(client->client_fd, SHUT_RDWR);
+    }
+
+    pthread_mutex_unlock(&file_mutex);
+
+    }
+
+    /* Wait for every thread and free its resources. */
+    while (!SLIST_EMPTY(&client_threads)) {
+        client = SLIST_FIRST(&client_threads);
+
+        pthread_join(client->thread_id, NULL);
+
+        SLIST_REMOVE_HEAD(&client_threads, entries);
+
+        free(client);
+    }
+}
+
+/* Append a timestamp to the data file every 10 seconds. */
+static void *timestamp_thread_func(void *arg)
+{
+    (void)arg;
+
+    while (!stop_requested) {
+
+        /* Sleep for 10 seconds, checking for shutdown. */
+        for (int i = 0; i < 10 && !stop_requested; i++) {
+            sleep(1);
+        }
+
+        if (stop_requested) {
+            break;
+        }
+
+        time_t now = time(NULL);
+        struct tm time_info;
+        char timestamp[128];
+
+        if (localtime_r(&now, &time_info) == NULL) {
+            syslog(LOG_ERR, "Failed to obtain local time");
+            continue;
+        }
+
+        size_t length = strftime(
+            timestamp,
+            sizeof(timestamp),
+            "timestamp:%a, %d %b %Y %T %z\n",
+            &time_info
+        );
+
+        if (length == 0) {
+            syslog(LOG_ERR, "Failed to format timestamp");
+            continue;
+        }
+
+        /* Protect the shared file from concurrent writes. */
+        pthread_mutex_lock(&file_mutex);
+
+        if (append_packet(timestamp, length) != 0) {
+            syslog(LOG_ERR, "Failed to append timestamp");
+        }
+
+        pthread_mutex_unlock(&file_mutex);
+    }
+
+    return NULL;
+}
+
 
 int main(int argc, char *argv[])
 {
@@ -280,11 +444,62 @@ int main(int argc, char *argv[])
             close(devnull);
         }
     }	
+    
+    /* Start the timestamp thread after daemonization. */
+    pthread_t timestamp_thread;
+
+    int timer_error = pthread_create(
+    	&timestamp_thread,
+    	NULL,
+    	timestamp_thread_func,
+    	NULL
+    );
+
+    if (timer_error != 0) {
+    	syslog(LOG_ERR, "Failed to create timestamp thread: %s",
+           strerror(timer_error));
+    	close(server_fd);
+    	closelog();
+    	return -1;
+    }
+
+
     printf("AESD socket server listening on port %d\n", PORT);
     fflush(stdout);
 
-    while (!stop_requested) {
-        struct sockaddr_in client_addr;
+	while (!stop_requested) {
+    cleanup_completed_threads();
+
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(server_fd, &read_fds);
+
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+
+    int ready = select(server_fd + 1, &read_fds,
+                       NULL, NULL, &timeout);
+
+    if (stop_requested) {
+        break;
+    }
+
+    if (ready == 0) {
+        continue;
+    }
+
+    if (ready < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+
+        syslog(LOG_ERR, "select failed: %s", strerror(errno));
+        break;
+    }
+
+    struct sockaddr_in client_addr;
+
         socklen_t client_len = sizeof(client_addr);
 
         int client_fd = accept(
@@ -311,18 +526,49 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 
-        handle_client(client_fd);
+	syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 
-        close(client_fd);
+/* Allocate information for this client thread. */
+struct client_thread *client = calloc(1, sizeof(*client));
 
-        syslog(LOG_INFO, "Closed connection from %s", client_ip);
+if (client == NULL) {
+    syslog(LOG_ERR, "Failed to allocate client thread");
+    close(client_fd);
+    continue;
+}
+
+client->client_fd = client_fd;
+
+strncpy(client->client_ip, client_ip,
+        sizeof(client->client_ip) - 1);
+
+/* Create a separate thread for this client. */
+int error = pthread_create(
+    &client->thread_id,
+    NULL,
+    client_thread_func,
+    client
+);
+
+if (error != 0) {
+    syslog(LOG_ERR, "pthread_create failed: %s",
+           strerror(error));
+    close(client_fd);
+    free(client);
+    continue;
+}
+
+/* Add the client thread to our linked list. */
+SLIST_INSERT_HEAD(&client_threads, client, entries);
     }
 
     syslog(LOG_INFO, "Caught signal, exiting");
 
     close(server_fd);
+    
+    /* Wait for all client threads before deleting the data file. */
+    shutdown_client_threads();
 
     if (unlink(DATA_FILE) == -1 && errno != ENOENT) {
         syslog(LOG_ERR, "Failed to delete data file: %s",
