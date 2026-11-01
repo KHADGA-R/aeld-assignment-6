@@ -15,4 +15,4 @@ EXTRA_IMAGE_FEATURES:append = " allow-root-login"
 IMAGE_FSTYPES:append = " ext4"
 
 #TODO: remove comment here to add to your image
-#CORE_IMAGE_EXTRA_INSTALL += "aesd-assignments"
+CORE_IMAGE_EXTRA_INSTALL += "aesd-assignments"
