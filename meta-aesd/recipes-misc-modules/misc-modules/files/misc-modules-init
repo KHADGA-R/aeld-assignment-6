@@ -1,0 +1,36 @@
+#!/bin/sh
+
+case "$1" in
+    start)
+        echo "Loading hello kernel module"
+        modprobe hello || exit 1
+
+        echo "Loading faulty kernel module"
+        modprobe faulty || exit 1
+
+        major=$(awk '$2 == "faulty" {print $1}' /proc/devices)
+        if [ -z "$major" ]; then
+            echo "Error: faulty major number not found"
+            exit 1
+        fi
+
+        rm -f /dev/faulty
+        mknod /dev/faulty c "$major" 0
+        chmod 666 /dev/faulty
+        ;;
+    stop)
+        echo "Unloading miscellaneous kernel modules"
+        rmmod faulty || exit 1
+        rmmod hello || exit 1
+        rm -f /dev/faulty
+        ;;
+    restart)
+        "$0" stop && "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit 0

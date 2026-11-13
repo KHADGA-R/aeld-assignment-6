@@ -1,0 +1,49 @@
+#!/bin/sh
+
+case "$1" in
+    start)
+        echo "Loading scull kernel module"
+        modprobe scull || exit 1
+
+        major=$(awk '$2 == "scull" {print $1}' /proc/devices)
+        if [ -z "$major" ]; then
+            echo "Error: scull major number not found"
+            exit 1
+        fi
+
+        for minor in 0 1 2 3; do
+            rm -f /dev/scull${minor}
+            mknod /dev/scull${minor} c "$major" "$minor"
+        done
+        ln -sf scull0 /dev/scull
+
+        for minor in 0 1 2 3; do
+            rm -f /dev/scullpipe${minor}
+            mknod /dev/scullpipe${minor} c "$major" "$((minor + 4))"
+        done
+        ln -sf scullpipe0 /dev/scullpipe
+
+        mknod /dev/scullsingle c "$major" 8
+        mknod /dev/sculluid c "$major" 9
+        mknod /dev/scullwuid c "$major" 10
+        mknod /dev/scullpriv c "$major" 11
+        chmod 664 /dev/scull[0-3] /dev/scullpipe[0-3] \
+            /dev/scullsingle /dev/sculluid /dev/scullwuid /dev/scullpriv
+        ;;
+    stop)
+        echo "Unloading scull kernel module"
+        rmmod scull || exit 1
+        rm -f /dev/scull /dev/scull[0-3]
+        rm -f /dev/scullpipe /dev/scullpipe[0-3]
+        rm -f /dev/scullsingle /dev/sculluid /dev/scullwuid /dev/scullpriv
+        ;;
+    restart)
+        "$0" stop && "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit 0
